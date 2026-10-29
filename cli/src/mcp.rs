@@ -15,6 +15,7 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -516,6 +517,76 @@ const MOBILE_PROFILE_TOOLS: &[&str] = &[
     TOOL_DEVICE,
 ];
 
+/// Run one MCP tool call without the stdio session, print its `tools/call`
+/// result as JSON, and return the process exit code: 0 on success, 1 when the
+/// tool reports an error, 2 when the call itself is invalid.
+pub fn run_mcp_call(args: &[String]) -> i32 {
+    let mut stdout = io::stdout();
+    let output = match parse_mcp_call(args) {
+        Ok((name, arguments, config)) => {
+            match call_tool(
+                Some(&json!({ "name": name, "arguments": arguments })),
+                &config,
+            ) {
+                Ok(mut result) => {
+                    result["_meta"] = json!({ "agentBrowserVersion": env!("CARGO_PKG_VERSION") });
+                    Ok(result)
+                }
+                Err(err) => Err((err.code, err.message)),
+            }
+        }
+        Err(message) => Err((-32602, message)),
+    };
+    let (value, code) = match output {
+        Ok(result) => {
+            let failed = result["isError"].as_bool().unwrap_or(false);
+            (result, if failed { 1 } else { 0 })
+        }
+        Err((code, message)) => (
+            json!({
+                "error": { "code": code, "message": message },
+                "_meta": { "agentBrowserVersion": env!("CARGO_PKG_VERSION") },
+            }),
+            2,
+        ),
+    };
+    if write_json_line(&mut stdout, &value).is_err() {
+        return 2;
+    }
+    code
+}
+
+fn parse_mcp_call(args: &[String]) -> Result<(String, Value, McpConfig), String> {
+    const USAGE: &str =
+        "Usage: agent-browser mcp call <tool> [<arguments-json> | -] [--tools <profiles>]";
+    let Some(name) = args.first().filter(|name| !name.starts_with('-')) else {
+        return Err(format!("Missing tool name\n{}", USAGE));
+    };
+    let (raw, rest) = match args.get(1) {
+        Some(value) if value == "-" => {
+            let mut input = String::new();
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|e| format!("Failed to read arguments from stdin: {}", e))?;
+            (Some(input), &args[2..])
+        }
+        Some(value) if !value.starts_with("--") => (Some(value.clone()), &args[2..]),
+        _ => (None, &args[1..]),
+    };
+    let arguments = match raw {
+        Some(raw) => serde_json::from_str(&raw)
+            .map_err(|e| format!("Tool arguments must be a JSON object: {}", e))?,
+        None => json!({}),
+    };
+    // Profiles only bound the size of `tools/list`, which a single call never sends.
+    let config = if rest.is_empty() {
+        McpConfig::from_profiles(vec![ToolProfile::All])
+    } else {
+        parse_mcp_config(rest)?
+    };
+    Ok((name.clone(), arguments, config))
+}
+
 /// Run the MCP stdio server until stdin closes or a `shutdown` request is
 /// received.
 pub fn run_mcp(args: &[String]) -> Result<(), String> {
@@ -946,7 +1017,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_SNAPSHOT,
             "Snapshot page",
-            "Return an accessibility-tree snapshot with reusable element refs.",
+            "Return an accessibility-tree snapshot with reusable element refs. If an action reports that a stale ref cannot be recovered, take a new snapshot and use a fresh ref.",
             json!({
                 "interactive": { "type": "boolean", "default": true, "description": "Only include interactive elements." },
                 "compact": { "type": "boolean", "default": false, "description": "Remove empty structural elements." },
@@ -1310,7 +1381,7 @@ fn parity_tools() -> Vec<Value> {
             TOOL_NETWORK_ROUTE,
             "Network route",
             "Route matching requests.",
-            json!({ "url": { "type": "string" }, "abort": { "type": "boolean" }, "body": { "type": "string" }, "resourceType": { "type": "string", "description": "Comma-separated resource types." } }),
+            json!({ "url": { "type": "string" }, "abort": { "type": "boolean" }, "body": { "type": "string" }, "allowOrigin": { "type": "string", "description": "Origin allowed to read the mocked body cross-origin." }, "resourceType": { "type": "string", "description": "Comma-separated resource types." } }),
             &["url"],
         ),
         tool(
@@ -1614,7 +1685,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_AUTH_LOGIN,
             "Auth login",
-            "Log in with a saved auth profile.",
+            "Log in with a saved auth profile. Control selection checks layout size, computed visibility and opacity, and disabled/readonly state. Replaced or focus-redirected credential fields fail without submitting.",
             json!({
                 "name": { "type": "string" },
                 "noNavigate": {
@@ -1656,7 +1727,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_STATE_LOAD,
             "State load",
-            "Load cookies and storage state.",
+            "Load cookies and storage state. Origins whose page does not stay on the saved origin are skipped and listed in skippedOrigins.",
             json!({ "path": { "type": "string" } }),
             &["path"],
         ),
@@ -1741,7 +1812,7 @@ fn parity_tools() -> Vec<Value> {
             TOOL_BATCH,
             "Batch",
             "Run multiple commands sequentially.",
-            json!({ "commands": { "type": "array", "items": { "type": "array", "items": { "type": "string" }, "minItems": 1 }, "minItems": 1 }, "bail": { "type": "boolean" } }),
+            json!({ "commands": { "type": "array", "items": { "type": "array", "items": { "type": "string" }, "minItems": 1 }, "minItems": 1 }, "bail": { "type": "boolean" }, "omitCommand": { "type": "boolean", "description": "Replace only command arrays with a stable zero-based input index. Does not make output safe for secrets: errors and response data are unchanged; type echoes typed text, and get value/eval may return input values." } }),
             &["commands"],
         ),
         tool(
@@ -1829,7 +1900,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_CONNECT,
             "Connect CDP",
-            "Connect to a browser over CDP. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state.",
+            "Connect to a browser over CDP. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state. The session stays attached until agent_browser_close, so later tools without a connection target use the same browser.",
             json!({
                 "target": { "type": "string", "description": "CDP port or URL." },
                 "pinTab": { "type": "boolean", "description": "Strict session-to-tab binding (sticky for the session). Explicit false disables a sticky pin; omitted leaves it unchanged." }
@@ -1924,7 +1995,7 @@ fn parity_tools() -> Vec<Value> {
                 "reference": { "type": "string", "description": "npm package, scoped package, or owner/repo GitHub reference." },
                 "name": { "type": "string", "description": "Override the configured plugin name." },
                 "capabilities": string_array_schema("Capabilities to declare when manifest discovery is skipped or unavailable."),
-                "global": { "type": "boolean", "default": false, "description": "Write ~/.agent-browser/config.json instead of ./agent-browser.json." },
+                "project": { "type": "boolean", "default": false, "description": "Write ./agent-browser.json instead of ~/.agent-browser/config.json." },
                 "noManifest": { "type": "boolean", "default": false, "description": "Skip plugin.manifest discovery." }
             }),
             &["reference"],
@@ -2130,7 +2201,14 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         "caCert".to_string(),
         json!({
             "type": "string",
-            "description": "Path to a CA certificate or PEM bundle trusted by a locally launched Chromium browser on Linux."
+            "description": "Path to a CA certificate or PEM bundle. Trusted by the CLI's own HTTPS requests (read, install, upgrade, doctor), and by a locally launched Chromium browser on Linux."
+        }),
+    );
+    props.insert(
+        "useSystemCa".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Use the operating system trust store instead of the built-in roots for the CLI's own HTTPS requests. Does not affect the browser."
         }),
     );
     props.insert(
@@ -2152,7 +2230,7 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         json!({
             "type": "array",
             "items": { "type": "string" },
-            "description": "Advanced: extra CLI arguments for this command, preserving full CLI parity."
+            "description": "Advanced: extra CLI arguments, including --engine chrome|lightpanda|obscura. Global flags that change network, file, policy, or host access (such as --allowed-domains, --executable-path, --args, --config) are rejected; set them in the MCP server environment or config. Obscura is experimental and rejects --proxy-bypass (including resolved config/environment settings). Explicit Obscura launches send this invocation's resolved bypass setting even to an existing daemon."
         }),
     );
     props.insert(
@@ -2266,10 +2344,57 @@ fn is_open_world_tool(name: &str) -> bool {
     )
 }
 
-fn is_known_tool(name: &str) -> bool {
+fn find_tool(name: &str) -> Option<Value> {
     tools()
-        .iter()
-        .any(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(name))
+        .into_iter()
+        .find(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// Returns an error naming any argument keys the tool's input schema does not declare.
+fn reject_unknown_arguments(
+    name: &str,
+    definition: &Value,
+    arguments: &Value,
+) -> Result<(), ProtocolError> {
+    let Some(args) = arguments.as_object() else {
+        return Ok(());
+    };
+    let empty = serde_json::Map::new();
+    let declared = definition
+        .pointer("/inputSchema/properties")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    let mut unknown: Vec<&str> = args
+        .keys()
+        .filter(|key| !declared.contains_key(*key))
+        .map(|key| key.as_str())
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort();
+    let shared = tool("", "", "", json!({}), &[]);
+    let shared_keys = shared
+        .pointer("/inputSchema/properties")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    let mut own: Vec<&str> = declared
+        .keys()
+        .filter(|key| !shared_keys.contains_key(*key))
+        .map(|key| key.as_str())
+        .collect();
+    own.sort();
+    let own = if own.is_empty() {
+        "none".to_string()
+    } else {
+        own.join(", ")
+    };
+    Err(ProtocolError::invalid_params(format!(
+        "Unknown argument(s) for {}: {}. Tool arguments: {}.",
+        name,
+        unknown.join(", "),
+        own
+    )))
 }
 
 fn wait_tool(
@@ -2301,12 +2426,12 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         .ok_or_else(|| ProtocolError::invalid_params("tools/call params.name must be a string"))?;
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
 
-    if !is_known_tool(name) {
+    let Some(tool_def) = find_tool(name) else {
         return Err(ProtocolError::invalid_params(format!(
             "Unknown tool: {}",
             name
         )));
-    }
+    };
 
     if !config.allows(name) {
         return Err(ProtocolError::invalid_params(format!(
@@ -2315,6 +2440,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
             config.profile_names().join(", ")
         )));
     }
+
+    reject_unknown_arguments(name, &tool_def, arguments)?;
 
     match name {
         TOOL_TOOLS_PROFILES => call_tools_profiles(config),
@@ -2550,6 +2677,44 @@ fn call_cli_tool(
     Ok(tool_result_from_run(run))
 }
 
+/// Global flags an MCP caller may pass in extraArgs; every other global flag must come from the server's environment or config.
+const MCP_EXTRA_ARGS_GLOBALS: &[&str] = &[
+    "--json",
+    "--headed",
+    "--webgpu",
+    "--no-webmcp",
+    "--debug",
+    "--hide-scrollbars",
+    "--annotate",
+    "--pin-tab",
+    "--no-pin-tab",
+    "-v",
+    "--verbose",
+    "-q",
+    "--quiet",
+    "--offline",
+    "--quick",
+    "--session",
+    "--namespace",
+    "--idle-timeout",
+    "--restore",
+    "--restore-save",
+    "--restore-check-url",
+    "--restore-check-text",
+    "--restore-check-fn",
+    "--device",
+    "--user-agent",
+    "--color-scheme",
+    "--engine",
+    "--input-mode",
+    "--screenshot-quality",
+    "--screenshot-format",
+];
+
+/// Global flags that tools set from their own typed arguments (screenshot's
+/// screenshotDir, doctor's fix, chat's model).
+const MCP_TOOL_GLOBALS: &[&str] = &["--screenshot-dir", "--fix", "--model"];
+
 fn cli_tool_args(
     arguments: &Value,
     command_args: Vec<String>,
@@ -2558,9 +2723,38 @@ fn cli_tool_args(
     let extra_args = optional_string_array(arguments, "extraArgs")?.unwrap_or_default();
     let mut args = vec!["--json".to_string()];
     append_common_global_args(&mut args, arguments, session)?;
+    // The CLI reads global flags anywhere in argv, so a tool argument such as
+    // a selector could otherwise carry its own --allowed-domains or --session.
+    let trusted: Vec<&str> = args.iter().map(|a| global_flag_name(a)).collect();
+    let tokens = command_args
+        .iter()
+        .map(|t| (t, MCP_TOOL_GLOBALS))
+        .chain(extra_args.iter().map(|t| (t, &[][..])));
+    for (token, tool_globals) in tokens {
+        let name = global_flag_name(token);
+        if !crate::flags::clean_args(&[name.to_string()]).is_empty() {
+            continue;
+        }
+        if !MCP_EXTRA_ARGS_GLOBALS.contains(&name) && !tool_globals.contains(&name) {
+            return Err(ProtocolError::invalid_params(format!(
+                "Tool arguments may not set {}; configure it in the MCP server's environment or config",
+                name
+            )));
+        }
+        if name != "--json" && trusted.contains(&name) {
+            return Err(ProtocolError::invalid_params(format!(
+                "Tool arguments may not set {}; it is already set for this call",
+                name
+            )));
+        }
+    }
     args.extend(command_args);
     args.extend(extra_args);
     Ok(args)
+}
+
+fn global_flag_name(token: &str) -> &str {
+    token.split('=').next().unwrap_or(token)
 }
 
 fn command_parts(command: &str) -> Vec<String> {
@@ -3146,6 +3340,10 @@ fn call_network_route(arguments: &Value) -> Result<Value, ProtocolError> {
         args.push("--body".to_string());
         args.push(body);
     }
+    if let Some(origin) = optional_string(arguments, "allowOrigin")? {
+        args.push("--allow-origin".to_string());
+        args.push(origin);
+    }
     if let Some(resource_type) = optional_string(arguments, "resourceType")? {
         args.push("--resource-type".to_string());
         args.push(resource_type);
@@ -3523,6 +3721,9 @@ fn call_batch(arguments: &Value) -> Result<Value, ProtocolError> {
     if optional_bool(arguments, "bail")?.unwrap_or(false) {
         args.push("--bail".to_string());
     }
+    if optional_bool(arguments, "omitCommand")?.unwrap_or(false) {
+        args.push("--omit-command".to_string());
+    }
     let stdin = serde_json::to_string(&parsed_commands)
         .map_err(|e| ProtocolError::invalid_params(format!("commands encode error: {}", e)))?;
     call_cli_tool(arguments, args, Some(stdin))
@@ -3650,8 +3851,8 @@ fn plugin_add_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
             args.push(capability);
         }
     }
-    if optional_bool(arguments, "global")?.unwrap_or(false) {
-        args.push("--global".to_string());
+    if optional_bool(arguments, "project")?.unwrap_or(false) {
+        args.push("--project".to_string());
     }
     if optional_bool(arguments, "noManifest")?.unwrap_or(false) {
         args.push("--no-manifest".to_string());
@@ -3971,6 +4172,14 @@ fn append_common_global_args(
     }
     if let Some(domains) = optional_string_array(arguments, "allowedDomains")? {
         if !domains.is_empty() {
+            if env::var_os("AGENT_BROWSER_ALLOWED_DOMAINS").is_some()
+                || crate::flags::load_config(&[])
+                    .is_ok_and(|c| c.allowed_domains.is_some_and(|d| !d.is_empty()))
+            {
+                return Err(ProtocolError::invalid_params(
+                    "allowedDomains is already set in the MCP server's environment or config",
+                ));
+            }
             args.push("--allowed-domains".to_string());
             args.push(domains.join(","));
         }
@@ -3988,15 +4197,47 @@ fn append_common_global_args(
     } else if clear_ca_cert {
         args.push("--no-ca-cert".to_string());
     }
+    if let Some(use_system_ca) = optional_bool(arguments, "useSystemCa")? {
+        args.push("--use-system-ca".to_string());
+        args.push(use_system_ca.to_string());
+    }
 
     Ok(())
 }
 
-fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Result<CliRun, String> {
-    let exe = env::current_exe().map_err(|e| e.to_string())?;
-    let mut command = Command::new(exe);
+const POST_EXIT_DRAIN: Duration = Duration::from_secs(2);
+
+fn spawn_reader<R: io::Read + Send + 'static>(
+    mut stream: R,
+) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let shared = Arc::clone(&buffer);
+    let handle = thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut chunk) {
+            if n == 0 || Arc::strong_count(&shared) == 1 {
+                break;
+            }
+            if let Ok(mut guard) = shared.lock() {
+                guard.extend_from_slice(&chunk[..n]);
+            }
+        }
+    });
+    (buffer, handle)
+}
+
+fn buffer_to_string(buffer: &Mutex<Vec<u8>>) -> String {
+    let bytes = buffer.lock().map(|g| g.clone()).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Runs a command with piped output and a timeout. After the child exits it waits at most two seconds for the pipes to close, so a detached grandchild holding them cannot block the caller.
+fn run_command(
+    mut command: Command,
+    stdin_body: Option<String>,
+    timeout_ms: u64,
+) -> Result<CliRun, String> {
     command
-        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(if stdin_body.is_some() {
@@ -4017,40 +4258,30 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
             .map_err(|e| format!("failed to write child stdin: {}", e))?;
     }
 
-    let mut child_stdout = child
+    let child_stdout = child
         .stdout
         .take()
         .ok_or_else(|| "failed to open child stdout".to_string())?;
-    let mut child_stderr = child
+    let child_stderr = child
         .stderr
         .take()
         .ok_or_else(|| "failed to open child stderr".to_string())?;
 
-    let stdout_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        child_stdout.read_to_end(&mut buf).map(|_| buf)
-    });
-    let stderr_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        child_stderr.read_to_end(&mut buf).map(|_| buf)
-    });
+    let (stdout_buf, stdout_thread) = spawn_reader(child_stdout);
+    let (stderr_buf, stderr_thread) = spawn_reader(child_stderr);
 
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let stdout = join_output(stdout_thread)?;
-                    let stderr = join_output(stderr_thread)?;
-                    return Ok(CliRun {
-                        exit_code: None,
-                        stdout,
-                        stderr: append_timeout_message(stderr, timeout_ms),
-                    });
+                    timed_out = true;
+                    break None;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
@@ -4058,22 +4289,30 @@ fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Resu
         }
     };
 
-    let stdout = join_output(stdout_thread)?;
-    let stderr = join_output(stderr_thread)?;
+    let deadline = Instant::now() + POST_EXIT_DRAIN;
+    while Instant::now() < deadline && !(stdout_thread.is_finished() && stderr_thread.is_finished())
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let stdout = buffer_to_string(&stdout_buf);
+    let mut stderr = buffer_to_string(&stderr_buf);
+    if timed_out {
+        stderr = append_timeout_message(stderr, timeout_ms);
+    }
 
     Ok(CliRun {
-        exit_code: status.code(),
+        exit_code: status.and_then(|s| s.code()),
         stdout,
         stderr,
     })
 }
 
-fn join_output(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<String, String> {
-    let bytes = handle
-        .join()
-        .map_err(|_| "failed to join output reader".to_string())?
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Result<CliRun, String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = Command::new(exe);
+    command.args(args);
+    run_command(command, stdin_body, timeout_ms)
 }
 
 fn append_timeout_message(stderr: String, timeout_ms: u64) -> String {
@@ -4144,6 +4383,10 @@ fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {
             });
             // Most hosts put text content in the model context; preserving
             // metadata only in structuredContent is not sufficient.
+            if let Some(warning) = primary.get("warning").and_then(Value::as_str) {
+                text.push_str("\n\nwarning: ");
+                text.push_str(warning);
+            }
             for context in contexts {
                 text.push_str("\n\n");
                 text.push_str(&context);
@@ -4202,6 +4445,20 @@ fn response_text(value: &Value) -> Option<String> {
                     .is_some()
             {
                 return Some(crate::output::format_a11y_text(data));
+            }
+            if let Some(skipped) = data
+                .get("skippedOrigins")
+                .and_then(|v| v.as_array())
+                .filter(|v| !v.is_empty())
+            {
+                let origins: Vec<&str> = skipped.iter().filter_map(|v| v.as_str()).collect();
+                return Some(format!(
+                    "{}\nSkipped storage for origins (page did not stay on that origin): {}",
+                    data.get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default(),
+                    origins.join(", ")
+                ));
             }
             for key in [
                 "snapshot", "text", "html", "report", "value", "content", "title", "url", "path",
@@ -4267,6 +4524,18 @@ fn write_json_line(stdout: &mut io::Stdout, value: &Value) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_text_keeps_response_warnings() {
+        let value = json!({ "success": true, "data": { "url": "about:blank" },
+                            "warning": "page_wedged: the active tab was replaced" });
+        let text = tool_text(Some(&value), "", "");
+        assert!(text.contains("about:blank"), "{text}");
+        assert!(
+            text.contains("page_wedged: the active tab was replaced"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn recording_timeline_options_use_cli_parser() {
         for operation in ["start", "restart"] {
@@ -4358,6 +4627,17 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn run_command_returns_when_a_grandchild_holds_the_pipe() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30 & echo ready");
+        let started = Instant::now();
+        let run = run_command(command, None, 25_000).expect("run_command should succeed");
+        assert!(run.stdout.contains("ready"), "stdout: {:?}", run.stdout);
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
     #[test]
     fn tools_list_contains_typed_tools() {
         let tools = tools();
@@ -4429,14 +4709,20 @@ mod tests {
 
     #[test]
     fn open_uses_cli_headless_selection_with_custom_windows_chrome() {
-        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_HEADED"]);
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_HEADED",
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+        ]);
         guard.set("AGENT_BROWSER_HEADED", "true");
+        guard.set(
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            "C:\\Chrome for Testing\\chrome.exe",
+        );
         // An MCP caller can explicitly select the headless/private-desktop
         // launch path even when the user's default is headed.
         let arguments = json!({
             "headed": false,
-            "url": "https://example.com",
-            "extraArgs": ["--executable-path", "C:\\Chrome for Testing\\chrome.exe"]
+            "url": "https://example.com"
         });
         let args = cli_tool_args(&arguments, open_args(&arguments).unwrap(), None).unwrap();
         let flags = crate::flags::parse_flags(&args);
@@ -4654,6 +4940,82 @@ mod tests {
         assert!(config.allows(TOOL_REACT_TREE));
     }
 
+    /// Every tool with its startup profiles, in the shape `tools/list` returns, for clients that ship the catalog.
+    fn tool_catalog() -> Value {
+        let profiles = [
+            ToolProfile::Core,
+            ToolProfile::Network,
+            ToolProfile::State,
+            ToolProfile::Debug,
+            ToolProfile::Tabs,
+            ToolProfile::React,
+            ToolProfile::Mobile,
+            ToolProfile::Webmcp,
+        ];
+        let mut tools = tools();
+        tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        for tool in &mut tools {
+            let name = tool["name"].as_str().unwrap_or_default().to_string();
+            tool["profiles"] = json!(profiles
+                .iter()
+                .filter(|profile| profile.tools().contains(&name.as_str()))
+                .map(|profile| profile.name())
+                .collect::<Vec<_>>());
+        }
+        json!({ "protocolVersion": PROTOCOL_VERSION, "tools": tools })
+    }
+
+    #[test]
+    fn mcp_tool_catalog_snapshot_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../packages/@agent-browser/sandbox/mcp-tools.json");
+        let expected = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&tool_catalog()).unwrap()
+        );
+        if std::env::var_os("AGENT_BROWSER_UPDATE_MCP_TOOLS").is_some() {
+            std::fs::write(&path, &expected).unwrap();
+        }
+        let actual = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            actual == expected,
+            "{} is out of date. Run `pnpm mcp-tools:sync`.",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn parse_mcp_call_defaults_to_every_tool() {
+        let (name, arguments, config) =
+            parse_mcp_call(&[TOOL_OPEN.into(), r#"{"url":"https://example.com"}"#.into()]).unwrap();
+        assert_eq!(name, TOOL_OPEN);
+        assert_eq!(arguments["url"], "https://example.com");
+        assert!(config.allows(TOOL_NETWORK_HAR_START));
+        assert!(config.allows(TOOL_REACT_TREE));
+    }
+
+    #[test]
+    fn parse_mcp_call_limits_tools_to_requested_profiles() {
+        let (_, arguments, config) =
+            parse_mcp_call(&[TOOL_OPEN.into(), "--tools".into(), "core".into()]).unwrap();
+        assert_eq!(arguments, json!({}));
+        assert!(config.allows(TOOL_OPEN));
+        assert!(!config.allows(TOOL_NETWORK_HAR_START));
+    }
+
+    #[test]
+    fn parse_mcp_call_rejects_missing_tool_and_bad_json() {
+        assert!(parse_mcp_call(&[])
+            .unwrap_err()
+            .contains("Missing tool name"));
+        assert!(parse_mcp_call(&["--tools".into()])
+            .unwrap_err()
+            .contains("Missing tool name"));
+        assert!(parse_mcp_call(&[TOOL_OPEN.into(), "{".into()])
+            .unwrap_err()
+            .contains("JSON object"));
+    }
+
     #[test]
     fn parse_mcp_config_rejects_unknown_profile() {
         let err = parse_mcp_config(&["--tools".into(), "bogus".into()]).unwrap_err();
@@ -4672,6 +5034,30 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("not enabled"));
+    }
+
+    #[test]
+    fn call_tool_rejects_unknown_argument() {
+        let err = call_tool(
+            Some(&json!({
+                "name": TOOL_TAB_CLOSE,
+                "arguments": {"tabId": "t13"}
+            })),
+            &McpConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("tabId"));
+        let listed = err.message.split("Tool arguments:").nth(1).unwrap();
+        assert!(listed.contains("tab"));
+        assert!(!listed.contains("session"));
+    }
+
+    #[test]
+    fn reject_unknown_arguments_accepts_declared_and_shared_keys() {
+        let definition = find_tool(TOOL_CLICK).unwrap();
+        let args = json!({"selector": "@e1", "session": "s", "timeoutMs": 5});
+        reject_unknown_arguments(TOOL_CLICK, &definition, &args).unwrap();
     }
 
     #[test]
@@ -4701,6 +5087,22 @@ mod tests {
             .unwrap()
             .contains("accessibility audits"));
         assert!(McpConfig::from_profiles(vec![ToolProfile::Debug]).allows(TOOL_A11Y));
+    }
+
+    #[test]
+    fn response_text_reports_skipped_state_origins() {
+        let text = response_text(&json!({
+            "success": true,
+            "data": {
+                "loaded": true,
+                "path": "./state.json",
+                "skippedOrigins": ["http://127.0.0.1:8001"]
+            }
+        }))
+        .unwrap();
+
+        assert!(text.starts_with("./state.json\n"));
+        assert!(text.contains("http://127.0.0.1:8001"));
     }
 
     #[test]
@@ -4784,7 +5186,7 @@ mod tests {
             "reference": "@company/agent-browser-plugin-vault",
             "name": "vault",
             "capabilities": ["credential.read", "command.run"],
-            "global": true,
+            "project": true,
             "noManifest": true,
         }))
         .unwrap();
@@ -4801,7 +5203,7 @@ mod tests {
                 "credential.read",
                 "--capability",
                 "command.run",
-                "--global",
+                "--project",
                 "--no-manifest",
             ]
         );
@@ -4827,6 +5229,116 @@ mod tests {
     }
 
     #[test]
+    fn obscura_extra_args_use_the_canonical_cli_parser() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            "AGENT_BROWSER_PROXY_BYPASS",
+        ]);
+        guard.set("AGENT_BROWSER_EXECUTABLE_PATH", "/tmp/obscura");
+        guard.set("AGENT_BROWSER_PROXY_BYPASS", "localhost");
+        let arguments = json!({"extraArgs": ["--engine", "obscura"]});
+        let args = cli_tool_args(&arguments, vec!["open".to_string()], None).unwrap();
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(flags.engine.as_deref(), Some("obscura"));
+        assert_eq!(flags.executable_path.as_deref(), Some("/tmp/obscura"));
+        assert_eq!(flags.proxy_bypass.as_deref(), Some("localhost"));
+        let mut launch = json!({"action": "launch"});
+        crate::attach_obscura_proxy_bypass(&mut launch, &flags);
+        assert_eq!(launch["proxyBypass"], "localhost");
+        assert!(launch.get("proxy").is_none());
+
+        let mut flags = flags;
+        flags.proxy_bypass = None;
+        crate::attach_obscura_proxy_bypass(&mut launch, &flags);
+        assert_eq!(launch.get("proxyBypass"), Some(&Value::Null));
+        for engine in [None, Some("chrome"), Some("lightpanda")] {
+            flags.engine = engine.map(String::from);
+            flags.proxy_bypass = Some("localhost".into());
+            let mut launch = json!({"action": "launch"});
+            crate::attach_obscura_proxy_bypass(&mut launch, &flags);
+            assert_eq!(launch, json!({"action": "launch"}));
+        }
+    }
+
+    #[test]
+    fn tool_arguments_cannot_carry_global_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_CONFIG",
+            "HOME",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_CONFIG");
+        guard.set("HOME", dir.path().to_str().unwrap());
+        let arguments = json!({ "session": "app", "allowedDomains": ["example.com"] });
+        for command in [
+            vec!["fill", "--allowed-domains", "evil.com"],
+            vec!["open", "--allowed-domains=evil.com"],
+            vec!["fill", "--session", "other"],
+            vec!["fill", "--init-script", "/x.js"],
+        ] {
+            let command = command.into_iter().map(String::from).collect();
+            let error = cli_tool_args(&arguments, command, Some("app")).unwrap_err();
+            assert!(error.message.contains("may not set"), "{}", error.message);
+        }
+        let open = cli_tool_args(
+            &arguments,
+            open_args(&json!({ "headed": true, "url": "https://example.com" })).unwrap(),
+            Some("app"),
+        );
+        assert!(open.is_ok());
+        let screenshot = cli_tool_args(
+            &arguments,
+            vec![
+                "--screenshot-dir".into(),
+                "/tmp".into(),
+                "screenshot".into(),
+            ],
+            Some("app"),
+        );
+        assert!(screenshot.is_ok());
+        let extra = json!({ "extraArgs": ["--screenshot-dir", "/tmp"] });
+        assert!(cli_tool_args(&extra, vec!["open".to_string()], None).is_err());
+    }
+
+    #[test]
+    fn extra_args_reject_operator_owned_globals() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_CONFIG",
+            "HOME",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_CONFIG");
+        guard.set("HOME", dir.path().to_str().unwrap());
+        for bad in [
+            vec!["--allowed-domains", "x"],
+            vec!["--action-policy", "/p"],
+            vec!["--confirm-actions", "none"],
+            vec!["--executable-path", "/bin/sh"],
+            vec!["--args", "--foo"],
+            vec!["--config", "/c.json"],
+            vec!["--allowed-domains=x"],
+        ] {
+            let arguments = json!({ "extraArgs": bad });
+            let error = cli_tool_args(&arguments, vec!["open".to_string()], None).unwrap_err();
+            assert!(error.message.contains("may not set"), "{:?}", bad);
+        }
+        for ok in [vec!["--engine", "obscura"], vec!["--full"], vec!["-i"]] {
+            let arguments = json!({ "extraArgs": ok });
+            assert!(cli_tool_args(&arguments, vec!["open".to_string()], None).is_ok());
+        }
+        guard.set("AGENT_BROWSER_ALLOWED_DOMAINS", "localhost");
+        let mut args = Vec::new();
+        let error =
+            append_common_global_args(&mut args, &json!({ "allowedDomains": ["127.0.0.1"] }), None)
+                .unwrap_err();
+        assert!(error.message.contains("already set"));
+    }
+
+    #[test]
     fn common_global_args_use_equals_form_for_string_restore_key() {
         let mut args = Vec::new();
 
@@ -4845,6 +5357,15 @@ mod tests {
 
     #[test]
     fn common_global_args_include_allowed_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            "AGENT_BROWSER_CONFIG",
+            "HOME",
+        ]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
+        guard.remove("AGENT_BROWSER_CONFIG");
+        guard.set("HOME", dir.path().to_str().unwrap());
         let mut args = Vec::new();
 
         append_common_global_args(
@@ -4889,6 +5410,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["--ca-cert", "/tmp/proxy-ca.pem"]);
+    }
+
+    #[test]
+    fn common_global_args_include_use_system_ca() {
+        let mut args = Vec::new();
+
+        append_common_global_args(&mut args, &json!({ "useSystemCa": true }), None).unwrap();
+
+        assert_eq!(args, vec!["--use-system-ca", "true"]);
     }
 
     #[test]
@@ -5323,6 +5853,27 @@ mod tests {
         assert!(!text.contains("\"webmcp\""));
         assert_eq!(result["structuredContent"]["response"], response);
         assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn tool_result_preserves_outcome_unknown_code() {
+        let run = CliRun {
+            exit_code: Some(1),
+            stdout: json!({
+                "success": false,
+                "error": "Failed to read: Connection reset by peer (os error 54) (the command reached the daemon but no response came back; it may or may not have run, so it was not retried)",
+                "code": "outcome_unknown"
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+
+        let result = tool_result_from_run(run);
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["response"]["code"],
+            "outcome_unknown"
+        );
     }
 
     #[test]
